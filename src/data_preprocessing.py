@@ -19,14 +19,17 @@ def aruco_extraction(img):
     Returns:
         numpy.ndarray or None: boundaries of the form
     """
-    dictionary = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 
     # Initialize the detector parameters using default values
-    parameters = cv2.aruco.DetectorParameters_create()
+    parameters =  cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
     # Detect the markers in the image
-    marker_corners, marker_ids, rejected_candidates = cv2.aruco.detectMarkers(
-        img, dictionary, parameters=parameters
+    
+
+    marker_corners, marker_ids, rejected_candidates = detector.detectMarkers(
+        img
     )
 
     # Checks how many markers are detected
@@ -110,7 +113,6 @@ def cell_extraction(
     num_vertical_lines = 14
     cell_width = form_width // num_vertical_lines
     cell_height = form_height // num_horizontal_lines
-
     for row in range(num_horizontal_lines):
         if type == "a":  # the directory is named for the form 'a'
             if row < 2:  # cells for number '0' and '1'
@@ -127,17 +129,14 @@ def cell_extraction(
                 directory = str(row - 11)
             else:  # cells for the second part of the letters
                 directory = str(row + 25)
-
         for col in range(num_vertical_lines):
             # calculates the position of the cells
             x1 = col * cell_width
             y1 = row * cell_height
             x2 = x1 + cell_width
             y2 = y1 + cell_height
-            cell = img[y1 + 7 :y2 - 7, x1 + 7 :x2 - 7]
-            cell = cv2.resize(cell, (cell_width, cell_height))
-            # applies preproccesing
-            cell = preprocess(cell, gaussian_kernel)
+            cell = img[y1+7:y2-7, x1+7:x2-7]
+            
             # drops the cells that contain markers
             if row < 2 and col < 2:
                 continue
@@ -148,17 +147,19 @@ def cell_extraction(
             if row > 18 and col > 11:
                 continue
 
-            cv2.imwrite(
-                extracted_dataset_path
-                + "/"
-                + directory
-                + "/"
-                + img_path[img_path.find("/" + type + "/") + 3 : -4]
-                + "_"
-                + str(col)
-                + ".jpg",
-                cell,
-            )
+            cell = preprocess(cell, gaussian_kernel)
+            if cell is not None:
+                cv2.imwrite(
+                    extracted_dataset_path
+                    + "/"
+                    + directory
+                    + "/"
+                    + img_path[img_path.find("/" + type + "\\") + 3 : -4]
+                    + "_"
+                    + str(col)
+                    + ".jpg",
+                    cell,
+                )
 
 
 def make_directories(path, num_classes):
@@ -181,6 +182,114 @@ def make_directories(path, num_classes):
         if not os.path.exists(path + "/" + str(i)):
             os.makedirs(path + "/" + str(i))
 
+def remove_grid_from_image(image, form_width, form_height):
+    """
+    removes the grid as a preprocessing from the forms and makes the data more clean 
+    despite the error in detecting lines by Hough Transform Line Detection Method
+
+    Args:
+        image: the image that is read using opencv(cv2)
+        form_width: the width of a typical form
+        form_height: the hight of a typical form
+    """
+    filter = True
+
+    img = image
+
+    gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray,90,150,apertureSize = 3)
+    kernel = np.ones((3,3),np.uint8)
+    edges = cv2.dilate(edges,kernel,iterations = 1)
+    kernel = np.ones((5,5),np.uint8)
+    edges = cv2.erode(edges,kernel,iterations = 1)
+    
+    cv2.imwrite("canny.jpg", edges)
+    lines2 = cv2.HoughLines(edges,1,np.pi/180,150)
+    lines3 = []
+    epsilon = np.pi/360.0
+    
+    if not np.array(lines2).any():
+        print('No lines were found')
+        return image
+    
+    num_horizontal_lines = 21
+    num_vertical_lines = 14
+    cell_width = form_width // num_vertical_lines
+    cell_height = form_height // num_horizontal_lines
+    lineapproxrhoh = np.array([cell_width*i for i in range(num_vertical_lines)])
+    lineapproxrhov = np.array([cell_height*j for j in range(num_horizontal_lines)])
+    for line in lines2:
+        rho, theta = line[0]
+        
+        if abs(theta - np.pi/2) < epsilon and np.any(abs(rho-lineapproxrhov) < 5):
+            lines3.append(line)
+        if abs(theta - 0) < epsilon and np.any(abs(rho-lineapproxrhoh) < 5):
+            lines3.append(line)
+    lines = np.array(lines3)
+
+
+    if filter:
+        rho_threshold = 32
+        theta_threshold = 0.1
+
+        # how many lines are similar to a given one
+        similar_lines = {i : [] for i in range(len(lines))}
+        for i in range(len(lines)):
+            for j in range(len(lines)):
+                if i == j:
+                    continue
+
+                rho_i,theta_i = lines[i][0]
+                rho_j,theta_j = lines[j][0]
+                if abs(rho_i - rho_j) < rho_threshold and abs(theta_i - theta_j) < theta_threshold:
+                    similar_lines[i].append(j)
+
+        # ordering the INDECES of the lines by how many are similar to them
+        indices = [i for i in range(len(lines))]
+        indices.sort(key=lambda x : len(similar_lines[x]))
+
+        # line flags is the base for the filtering
+        line_flags = len(lines)*[True]
+        for i in range(len(lines) - 1):
+            if not line_flags[indices[i]]: # if we already disregarded the ith element in the ordered list then we don't care (we will not delete anything based on it and we will never reconsider using this line again)
+                continue
+
+            for j in range(i + 1, len(lines)): # we are only considering those elements that had less similar line
+                if not line_flags[indices[j]]: # and only if we have not disregarded them already
+                    continue
+
+                rho_i,theta_i = lines[indices[i]][0]
+                rho_j,theta_j = lines[indices[j]][0]
+                if abs(rho_i - rho_j) < rho_threshold and abs(theta_i - theta_j) < theta_threshold:
+                    line_flags[indices[j]] = False # if it is similar and have not been disregarded yet then drop it now
+
+    print('number of Hough lines:', len(lines))
+
+    filtered_lines = []
+
+    if filter:
+        for i in range(len(lines)): # filtering
+            if line_flags[i]:
+                filtered_lines.append(lines[i])
+
+        print('Number of filtered lines:', len(filtered_lines))
+    else:
+        filtered_lines = lines
+
+    for line in filtered_lines:
+        rho,theta = line[0]
+        a = np.cos(theta)
+        b = np.sin(theta)
+        x0 = a*rho
+        y0 = b*rho
+        x1 = int(x0 + 1000*(-b))
+        y1 = int(y0 + 1000*(a))
+        x2 = int(x0 - 1000*(-b))
+        y2 = int(y0 - 1000*(a))
+
+        cv2.line(img,(x1,y1),(x2,y2),(255,255,255),2)
+
+    return img
 
 def label_dataset(
     dataset_path,
@@ -207,6 +316,7 @@ def label_dataset(
 
     for image_path in glob.glob(dataset_path + "/" + type + "/*.*"):
         image = cv2.imread(image_path)
+        
         corners = aruco_extraction(image)
         if corners is None:
             print(
@@ -214,8 +324,10 @@ def label_dataset(
             )
             continue
         form = form_extraction(image, corners, form_width, form_height)
+        form2 = remove_grid_from_image(form, form_width, form_height)
+        
         cell_extraction(
-            form,
+            form2,
             image_path,
             labeled_dataset_path,
             type,
